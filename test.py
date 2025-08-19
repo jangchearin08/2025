@@ -1,472 +1,256 @@
-pip install python-dotenv# app.py
-# 헤이 전용: 심리 프로파일링 + 영화 추천 Streamlit 앱
-# 기능:
-# - 다차원 심리 설문 → 점수화/해석
-# - TMDB API로 포스터/출연/줄거리 불러오기 (실패 시 로컬 큐레이션)
-# - 어떤 응답이든 항상 영화 추천 제공
-# - 개인 북마크 / 검색 / 기록 관리
-
 import os
-import time
-import textwrap
-from datetime import datetime
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 
-# -------------------------------
-# 초기 설정
-# -------------------------------
+# 1) 환경변수 로드
 load_dotenv()
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+TMDB_BASE = "https://api.themoviedb.org/3"
+IMG_BASE = "https://image.tmdb.org/t/p/w500"
 
-st.set_page_config(
-    page_title="마음 필름 – 심리×영화 추천",
-    page_icon="🎬",
-    layout="wide",
-)
-
-# 세션 스토리지
-if "responses" not in st.session_state:
-    st.session_state.responses = {}
-if "profile" not in st.session_state:
-    st.session_state.profile = None
-if "recommendations" not in st.session_state:
-    st.session_state.recommendations = []
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = []
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-# -------------------------------
-# 유틸
-# -------------------------------
-def clamp(x, lo=0, hi=100):
-    return max(lo, min(hi, x))
-
-def wrap(text, width=80):
-    return "\n".join(textwrap.wrap(text, width=width))
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def tmdb_search_movie(query, year=None, lang="ko-KR"):
-    if not TMDB_API_KEY:
-        return []
-    url = "https://api.themoviedb.org/3/search/movie"
-    params = {"api_key": TMDB_API_KEY, "query": query, "language": lang, "include_adult": "false"}
-    if year:
-        params["year"] = year
-    r = requests.get(url, params=params, timeout=10)
-    if r.status_code != 200:
-        return []
-    data = r.json().get("results", [])
-    return data
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def tmdb_movie_details(movie_id, lang="ko-KR"):
-    if not TMDB_API_KEY:
-        return {}
-    url = f"https://api.themoviedb.org/3/movie/{movie_id}"
-    params = {"api_key": TMDB_API_KEY, "language": lang, "append_to_response": "credits"}
-    r = requests.get(url, params=params, timeout=10)
-    if r.status_code != 200:
-        return {}
+# 2) 공용 요청 헬퍼
+def tmdb_get(path, params=None):
+    if params is None:
+        params = {}
+    headers = {"accept": "application/json"}
+    params["api_key"] = TMDB_API_KEY
+    r = requests.get(f"{TMDB_BASE}{path}", params=params, headers=headers, timeout=15)
+    r.raise_for_status()
     return r.json()
 
-def fetch_movie_by_title(title, prefer_year=None):
-    # 1) 검색
-    results = tmdb_search_movie(title, year=prefer_year)
-    if not results:
-        results = tmdb_search_movie(title, year=None)
-    if not results:
-        return None
+# 3) 넷플릭스 필터용 상수
+NETFLIX_PROVIDER_ID = 8  # TMDb watch provider id
 
-    # 2) 상세
-    first = results[0]
-    details = tmdb_movie_details(first["id"])
-    if not details:
-        return None
+# 4) 무드-장르/키워드 매핑
+MOOD_MAP = {
+    "위로가 필요해": {
+        "genres_movie": [35, 10749, 16],  # Comedy, Romance, Animation
+        "genres_tv": [18, 35],            # Drama, Comedy
+        "keywords": [],
+        "sort": "popularity.desc"
+    },
+    "카타르시스/스트레스 해소": {
+        "genres_movie": [28, 53, 80],     # Action, Thriller, Crime
+        "genres_tv": [10759, 80, 9648],   # Action & Adventure, Crime, Mystery
+        "keywords": [],
+        "sort": "vote_average.desc"
+    },
+    "불안이 커": {
+        "genres_movie": [18, 10751],      # Drama, Family
+        "genres_tv": [18, 10751],         # Drama, Family
+        "keywords": [],
+        "sort": "popularity.desc"
+    },
+    "무기력/번아웃": {
+        "genres_movie": [99, 10402, 18],  # Documentary, Music, Drama
+        "genres_tv": [99, 18],            # Documentary, Drama
+        "keywords": [],
+        "sort": "popularity.desc"
+    },
+    "설렘/두근거림": {
+        "genres_movie": [10749, 35],
+        "genres_tv": [18, 35, 10749],
+        "keywords": [],
+        "sort": "popularity.desc"
+    },
+    "깊게 몰입하고 싶어": {
+        "genres_movie": [9648, 878, 18],  # Mystery, Sci-Fi, Drama
+        "genres_tv": [9648, 18, 80],
+        "keywords": [],
+        "sort": "vote_average.desc"
+    },
+}
 
-    # 3) 가공
-    poster = details.get("poster_path")
-    poster_url = f"https://image.tmdb.org/t/p/w500{poster}" if poster else None
-    overview = details.get("overview") or first.get("overview") or "줄거리 정보가 준비 중이에요."
-    cast_list = []
-    credits = details.get("credits", {})
-    cast = credits.get("cast", [])[:5]
-    for c in cast:
-        name = c.get("name")
-        character = c.get("character")
-        if name and character:
-            cast_list.append(f"{name} ({character})")
-        elif name:
-            cast_list.append(name)
-
-    year = (details.get("release_date") or "")[:4]
-    return {
-        "title": details.get("title") or first.get("title") or title,
-        "year": year,
-        "overview": overview.strip(),
-        "poster_url": poster_url,
-        "cast": cast_list,
-        "tmdb_id": details.get("id"),
+# 5) TMDb Discover로 넷플릭스 제공작 가져오기
+def discover_titles(content_type, region="KR", lang="ko-KR", with_genres=None, sort_by="popularity.desc", page=1):
+    # content_type: "movie" or "tv"
+    path = f"/discover/{content_type}"
+    params = {
+        "with_watch_providers": NETFLIX_PROVIDER_ID,  # 넷플릭스
+        "watch_region": region,
+        "sort_by": sort_by,
+        "include_adult": "false",
+        "page": page,
+        "language": lang,
+        "with_original_language": None,  # 필요 시 제한
     }
+    if with_genres:
+        params["with_genres"] = ",".join(map(str, with_genres))
+    data = tmdb_get(path, params)
+    return data.get("results", [])
 
-# 로컬 백업 큐레이션 (API 없이도 항상 추천)
-LOCAL_POOL = [
-    {
-        "title": "리틀 포레스트",
-        "overview": "도시 생활에 지친 주인공이 고향으로 돌아와 사계절을 살며 자신을 회복해가는 이야기.",
-        "poster_url": "https://mblogthumb-phinf.pstatic.net/20180303_71/with_at_1519992865993S0hgu_JPEG/IMG_0815.JPG?type=w800",
-        "cast": ["김태리", "류준열", "진기주"],
-        "year": "2018",
-    },
-    {
-        "title": "월터의 상상은 현실이 된다",
-        "overview": "평범했던 삶을 벗어나 모험을 떠나는 월터의 성장기.",
-        "poster_url": "https://mblogthumb-phinf.pstatic.net/20140124_64/kiriko73_1390539319895cO0AS_JPEG/20140124_112705.jpg?type=w800",
-        "cast": ["Ben Stiller", "Kristen Wiig"],
-        "year": "2013",
-    },
-    {
-        "title": "말할 수 없는 비밀",
-        "overview": "피아노 선율 속 시간과 사랑을 넘나드는 청춘 로맨스.",
-        "poster_url": "https://mblogthumb-phinf.pstatic.net/20160509_69/yhlee0109_1462798268309h2nU2_JPEG/1.jpg?type=w800",
-        "cast": ["주걸륜", "계륜미"],
-        "year": "2008",
-    },
-    {
-        "title": "인사이드 아웃",
-        "overview": "머릿속 감정들의 분투기. 감정을 이해하고 받아들이는 여정.",
-        "poster_url": "https://mblogthumb-phinf.pstatic.net/20150714_43/dnjscl_1436862296523dZyXh_JPEG/insideoutposter.jpg?type=w800",
-        "cast": ["Amy Poehler", "Phyllis Smith"],
-        "year": "2015",
-    },
-]
+# 6) 상세 정보(출연, 예고편)
+def get_title_detail(content_type, tmdb_id, lang="ko-KR"):
+    detail = tmdb_get(f"/{content_type}/{tmdb_id}", {"language": lang})
+    credits = tmdb_get(f"/{content_type}/{tmdb_id}/credits", {"language": lang})
+    videos = tmdb_get(f"/{content_type}/{tmdb_id}/videos", {"language": lang})
+    cast = [c for c in credits.get("cast", [])][:8]
+    trailer_key = None
+    for v in videos.get("results", []):
+        if v.get("type") in ["Trailer", "Teaser"] and v.get("site") == "YouTube":
+            trailer_key = v.get("key")
+            break
+    return detail, cast, trailer_key
 
-# -------------------------------
-# 설문 구성
-# -------------------------------
-# 각 문항은 1~5점 (전혀 아니다 ~ 매우 그렇다)
-SECTIONS = {
-    "감정 상태": [
-        "요즘 이유 없이 마음이 가라앉는다.",
-        "감정 기복이 눈에 띄게 크다.",
-        "최근 일주일간 불안하거나 초조했다.",
-        "잠들기 전 생각이 과하게 많아진다.",
-    ],
-    "스트레스 대처": [
-        "압박이 와도 우선순위를 정하고 실행한다.",
-        "감정이 올라오면 적절히 표현/해소한다.",
-        "힘든 일을 작은 단위로 나눠 처리한다.",
-        "도움이 필요할 때 주변에 요청한다.",
-    ],
-    "애착/관계": [
-        "사람들과 있을 때도 묘한 외로움을 느낀다.",
-        "거절이 어려워 내 마음을 미룬다.",
-        "상대 반응에 과도하게 민감해진다.",
-        "관계에서 경계(선)를 잘 지킨다.",
-    ],
-    "동기·회복탄력": [
-        "일단 시작하면 끝까지 밀어붙이는 편이다.",
-        "실패를 학습 기회로 삼는다.",
-        "에너지 레벨을 스스로 관리한다.",
-        "목표를 기록하고 점검한다.",
-    ],
-    "몰입·창의": [
-        "시간 가는 줄 모르고 빠져드는 경험이 있다.",
-        "문제를 새로운 방식으로 풀어보려 한다.",
-        "혼자만의 상상/아이디어 시간이 필요하다.",
-        "작은 디테일도 즐긴다.",
-    ],
-}
-
-REVERSE_KEYS = {
-    # 높을수록 건강한 척도로 뒤집기
-    "스트레스 대처": [0, 1, 2, 3],
-    "동기·회복탄력": [0, 1, 2, 3],
-    "몰입·창의": [0, 1, 2, 3],
-}
-NEGATIVE_SECTIONS = ["감정 상태", "애착/관계"]  # 높을수록 어려움
-
-def score_profile(responses):
-    # 섹션별 평균(0~100 환산)
-    section_scores = {}
-    for sec, items in SECTIONS.items():
-        vals = []
-        for i in range(len(items)):
-            key = f"{sec}_{i}"
-            val = responses.get(key, 3)
-            # 역채점
-            if sec in REVERSE_KEYS and i in REVERSE_KEYS[sec]:
-                # 긍정 문항: 1(낮음)~5(높음) 그대로
-                # 이미 긍정이므로 뒤집지 않음
-                pass
-            vals.append(val)
-        avg = sum(vals) / max(1, len(vals))
-        pct = clamp((avg - 1) / 4 * 100, 0, 100)
-        section_scores[sec] = round(pct, 1)
-
-    # 방향성 조정: 부정 섹션은 '편안함' 점수로 변환(낮을수록 어려움 → 낮으면 빨간 신호)
-    comfort_map = {}
-    for sec, pct in section_scores.items():
-        if sec in NEGATIVE_SECTIONS:
-            comfort = 100 - pct  # 감정 편안함/관계 안정감
-            comfort_map[sec] = round(comfort, 1)
+# 7) 무드 스코어링(간단 문항 → 대표 무드)
+def infer_mood(answers):
+    # answers: dict
+    # 간단한 규칙 기반
+    scores = {
+        "위로가 필요해": 0,
+        "카타르시스/스트레스 해소": 0,
+        "불안이 커": 0,
+        "무기력/번아웃": 0,
+        "설렘/두근거림": 0,
+        "깊게 몰입하고 싶어": 0,
+    }
+    # 문항 가중치
+    if answers["오늘 기분"]:  # -5~+5
+        if answers["오늘 기분"] <= -2:
+            scores["위로가 필요해"] += 2
+            scores["무기력/번아웃"] += 1
+        elif answers["आज 기분"] if False else False:  # guard (무시)
+            pass
+        elif answers["오늘 기분"] >= 2:
+            scores["설렘/두근거림"] += 2
+    if answers["스트레스"]:  # 0~10
+        if answers["스트레스"] >= 7:
+            scores["카타르시스/스트레스 해소"] += 2
+            scores["깊게 몰입하고 싶어"] += 1
+    if answers["불안감"]:  # 0~10
+        if answers["불안감"] >= 6:
+            scores["불안이 커"] += 2
+    if answers["집중력"]:  # 0~10
+        if answers["집중력"] <= 3:
+            scores["무기력/번아웃"] += 2
         else:
-            comfort_map[sec] = pct
+            scores["깊게 몰입하고 싶어"] += 1
+    if answers["보고 싶은 톤"] == "밝고 따뜻한":
+        scores["위로가 필요해"] += 2
+        scores["설렘/두근거림"] += 1
+    elif answers["보고 싶은 톤"] == "강렬/짜릿한":
+        scores["카타르시스/스트레스 해소"] += 2
+    elif answers["보고 싶은 톤"] == "진지/사색":
+        scores["깊게 몰입하고 싶어"] += 2
 
-    # 종합 지표
-    mood = comfort_map["감정 상태"]
-    coping = comfort_map["스트레스 대처"]
-    attach = comfort_map["애착/관계"]
-    drive = comfort_map["동기·회복탄력"]
-    flow = comfort_map["몰입·창의"]
+    # 최고 점수 무드 선택(동점 시 임의 선택)
+    mood = max(scores, key=scores.get)
+    return mood, scores
 
-    profile = {
-        "감정 편안함": mood,
-        "스트레스 대처력": coping,
-        "관계 안정감": attach,
-        "동기·회복탄력": drive,
-        "몰입·창의": flow,
-    }
-    return profile
+# 8) Streamlit UI
+def main():
+    st.set_page_config(page_title="심리-무드 기반 넷플릭스 추천", page_icon="🎬", layout="wide")
+    st.title("지금 마음에 맞는 넷플릭스 추천 🎬")
+    st.caption("너의 현재 심리 상태를 가볍게 진단하고, 그 무드에 맞는 영화/시리즈를 골라줄게.")
 
-def interpret_profile(profile):
-    mood = profile["감정 편안함"]
-    coping = profile["스트레스 대처력"]
-    attach = profile["관계 안정감"]
-    drive = profile["동기·회복탄력"]
-    flow = profile["몰입·창의"]
+    with st.sidebar:
+        st.subheader("환경 설정")
+        region = st.text_input("국가 코드(예: KR, US, JP)", value="KR").upper().strip()
+        lang = st.selectbox("언어", ["ko-KR", "en-US"], index=0)
+        adult = st.checkbox("성인물 포함", value=False)
+        st.caption("국가 코드는 넷플릭스 제공 작품 필터에 바로 반영돼.")
 
-    highlights = []
-    cautions = []
-    suggestions = []
+    st.markdown("### 심리 상태 체크")
+    col1, col2 = st.columns(2)
+    with col1:
+        mood_val = st.slider("오늘 기분(-5=매우 다운, +5=매우 업)", -5, 5, 0)
+        stress = st.slider("스트레스", 0, 10, 5)
+        anxiety = st.slider("불안감", 0, 10, 4)
+    with col2:
+        focus = st.slider("집중력", 0, 10, 5)
+        tone = st.radio("오늘 보고 싶은 톤", ["밝고 따뜻한", "강렬/짜릿한", "진지/사색"], index=0)
+        include_tv = st.checkbox("시리즈도 추천에 포함", value=True)
 
-    # 하이라이트
-    if drive >= 60:
-        highlights.append("밀어붙이는 저력과 회복탄력이 살아있어. 파고들면 성과 난다.")
-    if flow >= 60:
-        highlights.append("몰입감이 좋아. 창의 모드 켜면 시간 순삭되는 타입.")
-    if coping >= 60:
-        highlights.append("스트레스 설계가 가능해. 우선순위·분할·표현 루틴이 작동 중.")
-
-    # 주의 영역
-    if mood < 50:
-        cautions.append("감정 파도가 잦아. 수면·호흡·루틴 정비가 필요해.")
-    if attach < 50:
-        cautions.append("관계 피로 누적. 경계 세우기와 솔직한 한 줄 표현 연습이 도움돼.")
-    if coping < 40:
-        cautions.append("대처력이 바닥까지 떨어지면 체력부터 회수하자. 최소 루틴으로 재부팅.")
-
-    # 제안
-    suggestions.extend([
-        "수면 고정: 취침/기상 7일 연속 고정, 낮잠은 20분 컷.",
-        "호흡 4-7-8, 3세트. 불안감 올라올 때 즉시 실행.",
-        "30분 타임박싱(작게 쪼개서 바로 시작) + 끝나면 5분 보상.",
-        "관계 경계 문장 3개 미리 준비: ‘지금은 어려워’, ‘다음에 이야기하자’, ‘내 페이스로 갈게’",
-        "아이디어 배출 10개/일, 평가 금지. 주 1회만 선별.",
-    ])
-
-    # 오늘의 한 줄 처방
-    if mood < 50 and coping < 50:
-        today = "몸 먼저 살리고, 일은 작게. 오늘은 ‘완벽’ 대신 ‘시작’."
-    elif drive >= 60 and flow >= 60:
-        today = "바람 불 때 돛 올려. 지금은 실행 모드 ON."
-    else:
-        today = "작게라도 한 칸. 리듬이 곧 안정이야."
-
-    return {
-        "highlights": highlights,
-        "cautions": cautions,
-        "suggestions": suggestions,
-        "today": today,
+    answers = {
+        "오늘 기분": mood_val,
+        "스트레스": stress,
+        "불안감": anxiety,
+        "집중력": focus,
+        "보고 싶은 톤": tone,
     }
 
-# -------------------------------
-# 심리 → 영화 테마 매핑
-# -------------------------------
-def derive_themes(profile):
-    themes = []
-    if profile["감정 편안함"] < 50:
-        themes += ["힐링", "정서 회복"]
-    if profile["스트레스 대처력"] < 50:
-        themes += ["성장", "재기", "작은 용기"]
-    if profile["관계 안정감"] < 50:
-        themes += ["우정", "자기 경계", "진심 소통"]
-    if profile["동기·회복탄력"] >= 60:
-        themes += ["모험", "도전"]
-    if profile["몰입·창의"] >= 60:
-        themes += ["상상력", "예술", "독특한 서사"]
-    if not themes:
-        themes = ["기분 좋은 여운", "밸런스 좋은 서사"]
-    return list(dict.fromkeys(themes))  # 중복 제거, 순서 유지
+    if st.button("추천 받기"):
+        if not TMDB_API_KEY:
+            st.error("TMDb API 키가 설정되지 않았어. .env 파일에 TMDB_API_KEY를 넣어줘.")
+            st.stop()
 
-def curate_titles_by_themes(themes):
-    # 테마 기반 후보 타이틀 (한국어 중심, 안정적 큐레이션)
-    bank = {
-        "힐링": ["리틀 포레스트", "코코", "인사이드 아웃"],
-        "정서 회복": ["원더", "웡카", "업"],
-        "성장": ["월터의 상상은 현실이 된다", "굿 윌 헌팅", "세상의 모든 계절"],
-        "재기": ["라라랜드", "위대한 쇼맨", "인턴"],
-        "작은 용기": ["소울", "빌리 엘리어트", "파수꾼"],
-        "우정": ["스탠 바이 미", "하이큐!!", "우리들"],
-        "자기 경계": ["설국열차", "벌새", "미스 리틀 선샤인"],
-        "진심 소통": ["말할 수 없는 비밀", "이터널 선샤인", "라라랜드"],
-        "모험": ["인터스텔라", "듄", "탑건: 매버릭"],
-        "도전": ["위플래쉬", "포드 V 페라리", "보헤미안 랩소디"],
-        "상상력": ["에브리씽 에브리웨어 올 앳 원스", "이터널 선샤인", "이상한 나라의 수학자"],
-        "예술": ["비긴 어게인", "퍼스트맨", "블랙스완"],
-        "독특한 서사": ["메멘토", "인셉션", "히든 피겨스"],
-        "기분 좋은 여운": ["리틀 포레스트", "어바웃 타임", "플립"],
-        "밸런스 좋은 서사": ["그랜드 부다페스트 호텔", "컨택트", "마션"],
-    }
-    titles = []
-    for t in themes:
-        titles += bank.get(t, [])
-    # 항상 최소 6편 보장 위해 로컬 풀 보강
-    if len(titles) < 6:
-        titles += [m["title"] for m in LOCAL_POOL]
-    # 중복 제거
-    titles = list(dict.fromkeys(titles))
-    return titles[:9]  # 너무 많으면 과부하 → 9편
+        mood, scores = infer_mood(answers)
+        st.success(f"지금 무드: {mood}")
+        with st.expander("무드 스코어 보기", expanded=False):
+            st.write(scores)
 
-def enrich_movie(title):
-    # TMDB 시도 → 실패 시 로컬 백업
-    info = fetch_movie_by_title(title)
-    if info:
-        return info
-    # 로컬에서 타이틀 매칭
-    for m in LOCAL_POOL:
-        if m["title"] == title:
-            return m
-    # 로컬 임의 반환
-    return LOCAL_POOL[0]
+        pref = MOOD_MAP.get(mood, MOOD_MAP["위로가 필요해"])
+        sort_by = pref["sort"]
+        adult_flag = "true" if adult else "false"
 
-# -------------------------------
-# UI
-# -------------------------------
-with st.sidebar:
-    st.title("마음 필름 🎬")
-    st.caption("네 심리를 읽고, 지금 딱 맞는 영화로 연결해줄게.")
-    if TMDB_API_KEY:
-        st.success("TMDB 연결 OK")
-    else:
-        st.warning("TMDB 키가 없어서 포스터/출연 정보가 제한될 수 있어. 환경변수 TMDB_API_KEY를 설정해줘.")
-    st.divider()
-    st.subheader("내 리스트")
-    if st.session_state.watchlist:
-        for i, m in enumerate(st.session_state.watchlist):
-            st.write(f"• {m['title']} ({m.get('year','')})")
-    else:
-        st.caption("아직 담은 영화가 없어.")
+        # Discover 영화
+        movies = discover_titles(
+            "movie",
+            region=region,
+            lang=lang,
+            with_genres=pref["genres_movie"],
+            sort_by=sort_by,
+            page=1
+        )
+        # 성인물 필터
+        movies = [m for m in movies if not m.get("adult")]
 
-st.title("심리 × 영화 추천")
-st.write("오늘 너 상태, 내가 예리하게 읽어줄게. 대신 솔직히만 답해. 어떤 답을 하든 영화는 무조건 추천해줄 거니까 걱정 노.")
+        # Discover TV (옵션)
+        shows = []
+        if include_tv:
+            shows = discover_titles(
+                "tv",
+                region=region,
+                lang=lang,
+                with_genres=pref["genres_tv"],
+                sort_by=sort_by,
+                page=1
+            )
 
-tab1, tab2, tab3 = st.tabs(["심리 설문", "결과 & 추천", "상담 기록"])
+        # 후보 섞고 상위 N
+        results = []
+        for m in movies[:10]:
+            results.append(("movie", m))
+        for t in shows[:10]:
+            results.append(("tv", t))
 
-with tab1:
-    st.subheader("빠르게, 하지만 깊게")
-    st.caption("각 문항에 1(전혀 아님) ~ 5(매우 그러함)으로 체크해줘.")
+        if not results:
+            st.warning("해당 무드/지역에서 넷플릭스 후보가 부족해. 무드 조건을 살짝 완화해서 다시 시도해볼래?")
+            st.stop()
 
-    with st.form("survey"):
-        for sec, items in SECTIONS.items():
-            st.markdown(f"#### {sec}")
-            cols = st.columns(4, gap="small")
-            for i, q in enumerate(items):
-                # 한 줄에 하나씩 보여주면 길어지니 2열 구성
-                c = cols[i % 4]
-                st.session_state.responses[f"{sec}_{i}"] = c.slider(
-                    q, min_value=1, max_value=5, value=3, key=f"{sec}_{i}_slider"
-                )
-        submitted = st.form_submit_button("분석하기")
-    if submitted:
-        st.session_state.profile = score_profile(st.session_state.responses)
-        interp = interpret_profile(st.session_state.profile)
-        themes = derive_themes(st.session_state.profile)
-        titles = curate_titles_by_themes(themes)
+        st.markdown("### 추천 결과")
+        for ctype, item in results:
+            colA, colB = st.columns([1, 2])
+            with colA:
+                poster = item.get("poster_path")
+                if poster:
+                    st.image(IMG_BASE + poster, use_column_width=True)
+                else:
+                    st.write("포스터 없음")
+            with colB:
+                title = item.get("title") if ctype == "movie" else item.get("name")
+                overview = item.get("overview") or "줄거리 정보가 부족해."
+                vote = item.get("vote_average", 0)
+                date = item.get("release_date") if ctype == "movie" else item.get("first_air_date")
+                st.subheader(f"{title}")
+                st.caption(f"형식: {('영화' if ctype=='movie' else '시리즈')} | 공개일: {date or '정보 없음'} | 평점: {vote:.1f}")
+                st.write(overview)
 
-        # 추천 생성/저장
-        recs = []
-        with st.spinner("네 무드에 맞는 필름을 고르고 있어…"):
-            for t in titles:
-                recs.append(enrich_movie(t))
-                time.sleep(0.05)
-        st.session_state.recommendations = recs
+                with st.expander("등장인물/예고편 자세히"):
+                    detail, cast, trailer_key = get_title_detail(ctype, item["id"], lang=lang)
+                    if cast:
+                        cast_names = ", ".join([c["name"] for c in cast if c.get("name")])
+                        st.write(f"주요 출연: {cast_names}")
+                    else:
+                        st.write("출연 정보 없음")
 
-        # 히스토리 저장
-        st.session_state.history.append({
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "profile": st.session_state.profile,
-            "themes": themes,
-            "recs": [r["title"] for r in recs],
-        })
-        st.success("분석 완료! 결과 탭에서 확인해봐.")
+                    if trailer_key:
+                        st.video(f"https://www.youtube.com/watch?v={trailer_key}")
+                    else:
+                        st.write("예고편 영상 없음")
 
-with tab2:
-    st.subheader("네 심리 리포트")
-    if not st.session_state.profile:
-        st.info("먼저 ‘심리 설문’에서 분석을 진행해줘.")
-    else:
-        prof = st.session_state.profile
-        interp = interpret_profile(prof)
-        themes = derive_themes(prof)
+        st.info("팁: 국가 코드를 바꾸면(예: US ↔ KR) 넷플릭스 제공작이 달라져. 무드도 다시 조정해봐.")
 
-        # 점수 카드
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("감정 편안함", f"{prof['감정 편안함']} / 100")
-        c2.metric("스트레스 대처력", f"{prof['스트레스 대처력']} / 100")
-        c3.metric("관계 안정감", f"{prof['관계 안정감']} / 100")
-        c4.metric("동기·회복탄력", f"{prof['동기·회복탄력']} / 100")
-        c5.metric("몰입·창의", f"{prof['몰입·창의']} / 100")
-
-        st.markdown("#### 요점 정리")
-        if interp["highlights"]:
-            st.write("• 강점: " + " / ".join(interp["highlights"]))
-        if interp["cautions"]:
-            st.write("• 주의: " + " / ".join(interp["cautions"]))
-        st.write("• 오늘의 한 줄: " + interp["today"])
-
-        st.markdown("#### 다음 7일 액션 가이드")
-        for s in interp["suggestions"]:
-            st.write(f"- {s}")
-
-        st.markdown("#### 너에게 핏한 테마")
-        st.write(", ".join(themes))
-
-        st.divider()
-        st.subheader("영화 추천 리스트")
-
-        # 필터
-        query = st.text_input("타이틀 검색(선택)", "")
-        cols = st.columns(3)
-        shown = 0
-        for m in st.session_state.recommendations:
-            if query and query.strip() not in m["title"]:
-                continue
-            with cols[shown % 3]:
-                st.markdown(f"**{m['title']}** ({m.get('year','')})")
-                if m.get("poster_url"):
-                    st.image(m["poster_url"], use_column_width=True)
-                st.caption("주요 출연: " + (", ".join(m.get("cast", [])[:5]) or "정보 준비 중"))
-                st.write(wrap(m.get("overview", "줄거리 정보가 준비 중이에요.")))
-                add_key = f"add_{m['title']}"
-                if st.button("내 리스트 담기", key=add_key):
-                    if m not in st.session_state.watchlist:
-                        st.session_state.watchlist.append(m)
-                        st.success("담았어.")
-            shown += 1
-
-with tab3:
-    st.subheader("지난 기록")
-    if not st.session_state.history:
-        st.caption("히스토리가 아직 없어.")
-    else:
-        for h in reversed(st.session_state.history[-10:]):
-            st.write(f"- {h['timestamp']} | 테마: {', '.join(h['themes'])} | 추천: {', '.join(h['recs'][:3])} ...")
-
-st.divider()
-st.caption("팁: TMDB API 키를 설정하면 포스터/출연/줄거리가 더 풍성해져.")
-
-
-# 끝.
+if __name__ == "__main__":
+    main()
