@@ -1,206 +1,399 @@
+"""
+MoodFlix: 심리 상태 기반 넷플릭스(Netflix) 콘텐츠 추천 앱
+- TMDB API를 이용해 포스터/줄거리/출연진/트레일러를 가져오고,
+  "시청 제공사(Watch Providers)" 정보를 통해 사용 국가에서 Netflix 제공 여부를 확인합니다.
+- 영화와 TV 시리즈를 모두 추천합니다.
+- 어떤 입력 조합(모든 경우의 수)에도 동작하도록, 멀티 선택/강도 가중치/대체 추천/오류 대비 로직을 포함합니다.
+
+필요 패키지 (터미널에서 설치):
+    pip install streamlit requests python-dotenv
+
+실행:
+    streamlit run app.py
+
+TMDB API 키 준비:
+- https://www.themoviedb.org/settings/api 에서 발급
+- .env 파일에 TMDB_API_KEY=YOUR_KEY 로 저장하거나, 앱 사이드바에서 직접 입력
+
+참고:
+- Netflix 제공 정보는 TMDB의 watch/providers 엔드포인트를 사용하며 완벽히 실시간/완전무결하지 않을 수 있습니다.
+- 국가 코드는 ISO-3166-1 (예: KR, US, JP 등)
+"""
+
 import os
+import random
+import time
+from typing import Dict, List, Tuple, Optional
+
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 
-# 1) 환경변수 로드
-load_dotenv()
-TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+# -------------------------------------
+# 기본 설정
+# -------------------------------------
+st.set_page_config(
+    page_title="MoodFlix | 심리 상태 기반 넷플릭스 추천",
+    page_icon="🎬",
+    layout="wide",
+)
+
+# 환경변수 로드 (.env 없으면 무시)
+try:
+    load_dotenv()
+except Exception:
+    pass
+
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 TMDB_BASE = "https://api.themoviedb.org/3"
-IMG_BASE = "https://image.tmdb.org/t/p/w500"
+TMDB_IMG = "https://image.tmdb.org/t/p/"
 
-# 2) 공용 요청 헬퍼
-def tmdb_get(path, params=None):
-    if params is None:
-        params = {}
+# Netflix provider id (TMDB 기준)
+NETFLIX_PROVIDER_ID = 8
+
+# -------------------------------------
+# 유틸: TMDB 요청
+# -------------------------------------
+
+def tmdb_request(endpoint: str, params: Optional[dict] = None) -> dict:
+    """TMDB API 호출 헬퍼 (오류 내성 포함)."""
+    url = f"{TMDB_BASE}/{endpoint.lstrip('/')}"
     headers = {"accept": "application/json"}
-    params["api_key"] = TMDB_API_KEY
-    r = requests.get(f"{TMDB_BASE}{path}", params=params, headers=headers, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    params = params.copy() if params else {}
+    params["api_key"] = st.session_state.get("TMDB_API_KEY", TMDB_API_KEY)
 
-# 3) 넷플릭스 필터용 상수
-NETFLIX_PROVIDER_ID = 8  # TMDb watch provider id
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        st.warning(f"TMDB 요청 오류: {endpoint} → {e}")
+        return {}
 
-# 4) 무드-장르 매핑
-MOOD_MAP = {
-    "위로가 필요해": {
-        "genres_movie": [35, 10749, 16],
-        "genres_tv": [18, 35],
-        "sort": "popularity.desc"
-    },
-    "카타르시스/스트레스 해소": {
-        "genres_movie": [28, 53, 80],
-        "genres_tv": [10759, 80, 9648],
-        "sort": "vote_average.desc"
-    },
-    "불안이 커": {
-        "genres_movie": [18, 10751],
-        "genres_tv": [18, 10751],
-        "sort": "popularity.desc"
-    },
-    "무기력/번아웃": {
-        "genres_movie": [99, 10402, 18],
-        "genres_tv": [99, 18],
-        "sort": "popularity.desc"
-    },
-    "설렘/두근거림": {
-        "genres_movie": [10749, 35],
-        "genres_tv": [18, 35, 10749],
-        "sort": "popularity.desc"
-    },
-    "깊게 몰입하고 싶어": {
-        "genres_movie": [9648, 878, 18],
-        "genres_tv": [9648, 18, 80],
-        "sort": "vote_average.desc"
-    },
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_genre_maps() -> Tuple[Dict[int, str], Dict[int, str]]:
+    movie = tmdb_request("genre/movie/list", {"language": "ko-KR"}).get("genres", [])
+    tv = tmdb_request("genre/tv/list", {"language": "ko-KR"}).get("genres", [])
+    return (
+        {g["id"]: g["name"] for g in movie},
+        {g["id"]: g["name"] for g in tv},
+    )
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_configuration() -> dict:
+    return tmdb_request("configuration")
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_provider_regions() -> List[str]:
+    data = tmdb_request("watch/providers/regions").get("results", [])
+    # ISO 3166-1 code 목록
+    return sorted({x.get("iso_3166_1", "") for x in data if x.get("iso_3166_1")})
+
+# -------------------------------------
+# 심리 → 추천 파이프라인 설정
+# -------------------------------------
+
+MOODS = [
+    "불안", "우울", "스트레스", "외로움", "분노", "무기력",
+    "행복", "호기심", "설렘(로맨틱)", "두려움(스릴)", "위로/힐링", "몰입/도전"
+]
+
+# 각 심리에 연결할 장르/키워드 후보 (가중치 기반)
+MOOD_TO_GENRES = {
+    "불안": {"movie": [53, 9648], "tv": [80, 9648]},          # 스릴러, 미스터리 / 범죄
+    "우울": {"movie": [18, 10749], "tv": [18]},               # 드라마, 로맨스
+    "스트레스": {"movie": [35, 16], "tv": [35, 16]},          # 코미디, 애니
+    "외로움": {"movie": [18, 10749], "tv": [18]},             # 드라마/로맨스
+    "분노": {"movie": [28, 80], "tv": [10759, 80]},           # 액션, 범죄
+    "무기력": {"movie": [12, 14, 878], "tv": [10765, 10759]},# 모험, 판타지, SF / Sci-Fi & Fantasy, 액션&모험
+    "행복": {"movie": [35, 10402], "tv": [35]},              # 코미디, 음악
+    "호기심": {"movie": [99, 36], "tv": [99, 36]},           # 다큐, 역사
+    "설렘(로맨틱)": {"movie": [10749, 35], "tv": [10766, 35]},# 로맨스, 코미디(일일연속극 대체: Soap=10766)
+    "두려움(스릴)": {"movie": [27, 53], "tv": [9648, 80]},     # 공포, 스릴러 / 미스터리
+    "위로/힐링": {"movie": [16, 12, 10751], "tv": [16, 10751]},# 애니, 가족
+    "몰입/도전": {"movie": [18, 28], "tv": [18, 10759]},      # 드라마, 액션&모험
 }
 
-# 5) Discover로 넷플릭스 제공작 가져오기
-def discover_titles(content_type, region="KR", lang="ko-KR", with_genres=None, sort_by="popularity.desc", page=1):
-    path = f"/discover/{content_type}"
+# -------------------------------------
+# TMDB 탐색/필터링
+# -------------------------------------
+
+@st.cache_data(show_spinner=False, ttl=60 * 30)
+def discover_titles(kind: str, with_genres: List[int], page: int = 1, language: str = "ko-KR") -> List[dict]:
+    """영화/TV discover 결과 반환."""
+    assert kind in ("movie", "tv")
+    endpoint = f"discover/{kind}"
     params = {
-        "with_watch_providers": NETFLIX_PROVIDER_ID,
-        "watch_region": region,
-        "sort_by": sort_by,
+        "language": language,
+        "sort_by": "popularity.desc",
         "include_adult": "false",
         "page": page,
-        "language": lang,
     }
     if with_genres:
         params["with_genres"] = ",".join(map(str, with_genres))
-    data = tmdb_get(path, params)
+    data = tmdb_request(endpoint, params)
     return data.get("results", [])
 
-# 6) 상세 정보(출연, 예고편)
-def get_title_detail(content_type, tmdb_id, lang="ko-KR"):
-    detail = tmdb_get(f"/{content_type}/{tmdb_id}", {"language": lang})
-    credits = tmdb_get(f"/{content_type}/{tmdb_id}/credits", {"language": lang})
-    videos = tmdb_get(f"/{content_type}/{tmdb_id}/videos", {"language": lang})
-    cast = [c for c in credits.get("cast", [])][:8]
-    trailer_key = None
-    for v in videos.get("results", []):
-        if v.get("type") in ["Trailer", "Teaser"] and v.get("site") == "YouTube":
-            trailer_key = v.get("key")
-            break
-    return detail, cast, trailer_key
+@st.cache_data(show_spinner=False, ttl=60 * 30)
+def get_watch_providers(kind: str, tmdb_id: int) -> dict:
+    return tmdb_request(f"{kind}/{tmdb_id}/watch/providers")
 
-# 7) 무드 스코어링
-def infer_mood(answers):
-    scores = {k: 0 for k in MOOD_MAP.keys()}
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_credits(kind: str, tmdb_id: int) -> dict:
+    return tmdb_request(f"{kind}/{tmdb_id}/credits", {"language": "ko-KR"})
 
-    if answers["오늘 기분"] <= -2:
-        scores["위로가 필요해"] += 2
-        scores["무기력/번아웃"] += 1
-    elif answers["오늘 기분"] >= 2:
-        scores["설렘/두근거림"] += 2
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_details(kind: str, tmdb_id: int) -> dict:
+    return tmdb_request(f"{kind}/{tmdb_id}", {"language": "ko-KR"})
 
-    if answers["스트레스"] >= 7:
-        scores["카타르시스/스트레스 해소"] += 2
-        scores["깊게 몰입하고 싶어"] += 1
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_videos(kind: str, tmdb_id: int) -> List[dict]:
+    data = tmdb_request(f"{kind}/{tmdb_id}/videos", {"language": "ko-KR"})
+    results = data.get("results", [])
+    # 한글이 없으면 영어 트레일러라도 추가로 시도
+    if not results:
+        results = tmdb_request(f"{kind}/{tmdb_id}/videos", {"language": "en-US"}).get("results", [])
+    return results
 
-    if answers["불안감"] >= 6:
-        scores["불안이 커"] += 2
+# -------------------------------------
+# Netflix 제공 여부 확인
+# -------------------------------------
 
-    if answers["집중력"] <= 3:
-        scores["무기력/번아웃"] += 2
-    else:
-        scores["깊게 몰입하고 싶어"] += 1
+def is_on_netflix(provider_data: dict, region: str) -> bool:
+    if not provider_data:
+        return False
+    results = provider_data.get("results", {})
+    if not results or region not in results:
+        return False
+    region_info = results.get(region, {})
+    for key in ("flatrate", "ads", "buy", "rent"):
+        offers = region_info.get(key) or []
+        for o in offers:
+            if o.get("provider_id") == NETFLIX_PROVIDER_ID:
+                return True
+    return False
 
-    if answers["보고 싶은 톤"] == "밝고 따뜻한":
-        scores["위로가 필요해"] += 2
-        scores["설렘/두근거림"] += 1
-    elif answers["보고 싶은 톤"] == "강렬/짜릿한":
-        scores["카타르시스/스트레스 해소"] += 2
-    elif answers["보고 싶은 톤"] == "진지/사색":
-        scores["깊게 몰입하고 싶어"] += 2
+# -------------------------------------
+# 추천 로직
+# -------------------------------------
 
-    mood = max(scores, key=scores.get)
-    return mood, scores
+def rank_and_pick(candidates: List[dict], k: int = 12) -> List[dict]:
+    """평점/인기도를 혼합해 간단 랭킹 후 상위 k개 선택."""
+    def score(x):
+        return (x.get("vote_average", 0) * 0.6) + (x.get("popularity", 0) * 0.4)
+    ranked = sorted(candidates, key=score, reverse=True)
+    return ranked[:k]
 
-# 8) Streamlit UI
-def main():
-    st.set_page_config(page_title="심리-무드 기반 넷플릭스 추천", page_icon="🎬", layout="wide")
-    st.title("지금 마음에 맞는 넷플릭스 추천 🎬")
-    st.caption("현재 심리 상태에 맞는 영화/시리즈를 추천해줄게요!")
+def build_recommendations(
+    moods: List[str],
+    country: str,
+    include_tv: bool,
+    include_movie: bool,
+    intensity: Dict[str, int],  # 각 무드 강도(1~5)
+    allow_non_netflix: bool,
+    pages: int = 3,
+) -> List[Tuple[str, dict]]:
+    random.seed(42)
+    movie_genres_map, tv_genres_map = get_genre_maps()
 
-    with st.sidebar:
-        region = st.text_input("국가 코드(예: KR, US, JP)", value="KR").upper().strip()
-        lang = st.selectbox("언어", ["ko-KR", "en-US"], index=0)
-        adult = st.checkbox("성인물 포함", value=False)
+    # 요청한 모든 경우 조합 반영: 무드별 장르 집합을 합산(강도 가중치)하여 우선순위 부여
+    movie_genres_weight: Dict[int, int] = {}
+    tv_genres_weight: Dict[int, int] = {}
 
-    st.markdown("### 심리 상태 체크")
-    col1, col2 = st.columns(2)
-    with col1:
-        mood_val = st.slider("오늘 기분(-5=매우 다운, +5=매우 업)", -5, 5, 0)
-        stress = st.slider("스트레스", 0, 10, 5)
-        anxiety = st.slider("불안감", 0, 10, 4)
-    with col2:
-        focus = st.slider("집중력", 0, 10, 5)
-        tone = st.radio("오늘 보고 싶은 톤", ["밝고 따뜻한", "강렬/짜릿한", "진지/사색"], index=0)
-        include_tv = st.checkbox("시리즈도 포함", value=True)
-
-    answers = {
-        "오늘 기분": mood_val,
-        "스트레스": stress,
-        "불안감": anxiety,
-        "집중력": focus,
-        "보고 싶은 톤": tone,
-    }
-
-    if st.button("추천 받기"):
-        if not TMDB_API_KEY:
-            st.error("TMDb API 키가 설정되지 않았습니다. .env 파일에 TMDB_API_KEY를 넣어주세요.")
-            st.stop()
-
-        mood, scores = infer_mood(answers)
-        st.success(f"지금 무드: {mood}")
-
-        pref = MOOD_MAP.get(mood)
-        sort_by = pref["sort"]
-
-        # 영화 가져오기
-        movies = discover_titles("movie", region=region, lang=lang, with_genres=pref["genres_movie"], sort_by=sort_by)
-        if not movies:  # fallback (장르 제한 해제)
-            movies = discover_titles("movie", region=region, lang=lang, sort_by="popularity.desc")
-
-        # 시리즈 가져오기
-        shows = []
+    for m in moods:
+        mapping = MOOD_TO_GENRES.get(m, {})
+        if include_movie:
+            for gid in mapping.get("movie", []):
+                movie_genres_weight[gid] = movie_genres_weight.get(gid, 0) + max(1, intensity.get(m, 1))
         if include_tv:
-            shows = discover_titles("tv", region=region, lang=lang, with_genres=pref["genres_tv"], sort_by=sort_by)
-            if not shows:
-                shows = discover_titles("tv", region=region, lang=lang, sort_by="popularity.desc")
+            for gid in mapping.get("tv", []):
+                tv_genres_weight[gid] = tv_genres_weight.get(gid, 0) + max(1, intensity.get(m, 1))
 
-        results = [("movie", m) for m in movies[:10]] + [("tv", t) for t in shows[:10]]
+    def gather(kind: str, genre_weight: Dict[int, int]) -> List[dict]:
+        if not genre_weight:
+            return []
+        # 가중치가 높은 장르부터 차례로 discover 호출
+        ordered = [gid for gid, _ in sorted(genre_weight.items(), key=lambda kv: kv[1], reverse=True)]
+        collected: List[dict] = []
+        for gid in ordered:
+            for p in range(1, pages + 1):
+                items = discover_titles(kind, [gid], page=p)
+                collected.extend(items)
+        # 중복 제거 (id 기반)
+        uniq = { (x.get("id")): x for x in collected }
+        return list(uniq.values())
 
-        if not results:
-            st.warning("추천할 작품을 찾지 못했습니다. 국가 코드를 바꿔보세요!")
-            st.stop()
+    all_candidates: List[Tuple[str, dict]] = []
 
-        st.markdown("### 추천 결과")
-        for ctype, item in results:
-            colA, colB = st.columns([1, 2])
-            with colA:
-                poster = item.get("poster_path")
-                if poster:
-                    st.image(IMG_BASE + poster, use_column_width=True)
-                else:
-                    st.write("포스터 없음")
-            with colB:
-                title = item.get("title") if ctype == "movie" else item.get("name")
-                overview = item.get("overview") or "줄거리 정보가 없습니다."
+    if include_movie:
+        movies = gather("movie", movie_genres_weight)
+        for m in rank_and_pick(movies, k=60):
+            all_candidates.append(("movie", m))
+    if include_tv:
+        tvs = gather("tv", tv_genres_weight)
+        for t in rank_and_pick(tvs, k=60):
+            all_candidates.append(("tv", t))
+
+    # Netflix 필터링
+    filtered: List[Tuple[str, dict]] = []
+    fallback: List[Tuple[str, dict]] = []
+    for kind, item in all_candidates:
+        providers = get_watch_providers(kind, item["id"]) or {}
+        on_nf = is_on_netflix(providers, country)
+        if on_nf:
+            filtered.append((kind, item))
+        else:
+            fallback.append((kind, item))
+
+    if not filtered and allow_non_netflix:
+        filtered = fallback  # 넷플릭스 없으면 대체로 채우기
+
+    # 최종 12~18개 정도 반환
+    random.shuffle(filtered)
+    return filtered[:18]
+
+# -------------------------------------
+# UI
+# -------------------------------------
+
+with st.sidebar:
+    st.header("🔑 API & 환경 설정")
+    api_in = st.text_input("TMDB API Key", value=TMDB_API_KEY, type="password", help=".env에 TMDB_API_KEY로 저장하거나 여기 입력")
+    if api_in:
+        st.session_state["TMDB_API_KEY"] = api_in
+
+    regions = get_provider_regions()
+    default_region = "KR" if "KR" in regions else (regions[0] if regions else "KR")
+    country = st.selectbox("시청 국가 (Netflix 제공 지역)", options=regions or ["KR", "US"], index=(regions.index(default_region) if default_region in regions else 0))
+
+    st.markdown("---")
+    st.subheader("⚙️ 추천 옵션")
+    include_movie = st.checkbox("영화 포함", value=True)
+    include_tv = st.checkbox("TV 시리즈 포함", value=True)
+    allow_non_netflix = st.checkbox("넷플릭스에 없으면 대체(비넷플릭스)도 허용", value=False)
+    pages = st.slider("탐색 범위(깊이)", 1, 5, 3, help="클수록 더 많은 후보를 훑어 더 다양한 추천")
+
+st.title("🎬 MoodFlix")
+st.caption("나의 지금 심리 상태를 바탕으로 Netflix에서 볼만한 작품을 추천해드려요.")
+
+st.markdown("""
+### 🧠 지금 심리 체크
+아래 문항을 선택하면 해당 무드(감정) 강도를 반영해 작품을 고릅니다. (모두 복수 선택 가능)
+""")
+
+cols = st.columns(4)
+selected_moods: List[str] = []
+intensity: Dict[str, int] = {}
+for i, mood in enumerate(MOODS):
+    with cols[i % 4]:
+        on = st.toggle(f"{mood}", key=f"m_{i}")
+        if on:
+            selected_moods.append(mood)
+            intensity[mood] = st.slider(f"{mood} 강도", 1, 5, 3, key=f"s_{i}")
+
+# 모든 경우의 수: 아무것도 선택하지 않아도 동작하도록 기본값 제공
+if not selected_moods:
+    st.info("무드를 하나도 선택하지 않으셨어요. 기본 추천(지금 인기 콘텐츠)으로 보여드릴게요 ✨")
+    selected_moods = ["행복", "호기심"]
+    intensity = {"행복": 3, "호기심": 3}
+
+run = st.button("🔍 추천 보기")
+
+if run:
+    if not (st.session_state.get("TMDB_API_KEY") or TMDB_API_KEY):
+        st.error("TMDB API Key가 필요해요. 사이드바에 입력해주세요.")
+        st.stop()
+
+    with st.spinner("당신의 무드에 딱 맞는 작품을 찾는 중…"):
+        recs = build_recommendations(
+            moods=selected_moods,
+            country=country,
+            include_tv=include_tv,
+            include_movie=include_movie,
+            intensity=intensity,
+            allow_non_netflix=allow_non_netflix,
+            pages=pages,
+        )
+
+    if not recs:
+        st.warning("조건에 맞는 작품을 찾지 못했어요. 옵션을 넓혀보거나 '대체 허용'을 켜보세요.")
+    else:
+        st.subheader("🎯 추천 결과")
+        st.caption(f"선택 무드: {', '.join(selected_moods)} | 국가: {country} | 작품 수: {len(recs)}")
+
+        # 카드 그리드
+        ncol = 3
+        rows = (len(recs) + ncol - 1) // ncol
+        for r in range(rows):
+            ccols = st.columns(ncol)
+            for ci in range(ncol):
+                idx = r * ncol + ci
+                if idx >= len(recs):
+                    continue
+                kind, item = recs[idx]
+                title = item.get("title") or item.get("name")
+                poster_path = item.get("poster_path")
                 vote = item.get("vote_average", 0)
-                date = item.get("release_date") if ctype == "movie" else item.get("first_air_date")
-                st.subheader(title)
-                st.caption(f"{'영화' if ctype=='movie' else '시리즈'} | 공개일: {date or '정보 없음'} | 평점: {vote:.1f}")
-                st.write(overview)
+                tmdb_id = item.get("id")
 
-                with st.expander("출연/예고편"):
-                    detail, cast, trailer_key = get_title_detail(ctype, item["id"], lang=lang)
-                    if cast:
-                        st.write("주요 출연: " + ", ".join([c["name"] for c in cast]))
-                    if trailer_key:
-                        st.video(f"https://www.youtube.com/watch?v={trailer_key}")
+                with ccols[ci]:
+                    with st.container(border=True):
+                        # 포스터
+                        if poster_path:
+                            st.image(f"{TMDB_IMG}w500{poster_path}", use_column_width=True)
+                        else:
+                            st.write("(포스터 없음)")
 
-if __name__ == "__main__":
-    main()
+                        st.markdown(f"#### {'🎞️' if kind=='movie' else '📺'} {title}")
+                        st.caption(f"평점 ★ {vote:.1f} | TMDB ID: {tmdb_id}")
+
+                        # 상세/출연진
+                        details = get_details(kind, tmdb_id) or {}
+                        overview = details.get("overview") or item.get("overview") or "줄거리 정보가 아직 없어요."
+                        st.write(overview)
+
+                        credits = get_credits(kind, tmdb_id) or {}
+                        cast = credits.get("cast", [])
+                        if cast:
+                            top_cast = ", ".join([c.get("name", "") for c in cast[:5]])
+                            st.caption(f"👥 출연: {top_cast}")
+
+                        # 시청 제공사 표기
+                        providers = get_watch_providers(kind, tmdb_id) or {}
+                        on_nf = is_on_netflix(providers, country)
+                        if on_nf:
+                            st.success(f"✅ 이 작품은 {country} 지역 Netflix에서 제공 중일 가능성이 높아요.")
+                        else:
+                            st.warning("❌ 현재 지역 Netflix 제공 정보가 없어요 (TMDB 기준).")
+
+                        # 트레일러 버튼
+                        vids = [v for v in get_videos(kind, tmdb_id) if v.get("site") in ("YouTube", "Vimeo")]
+                        if vids:
+                            yt = next((v for v in vids if v.get("type") in ("Trailer", "Teaser")), vids[0])
+                            key = yt.get("key")
+                            site = yt.get("site")
+                            if site == "YouTube" and key:
+                                st.link_button("▶️ 트레일러 보기 (YouTube)", f"https://www.youtube.com/watch?v={key}")
+                            elif site == "Vimeo" and key:
+                                st.link_button("▶️ 트레일러 보기 (Vimeo)", f"https://vimeo.com/{key}")
+
+                        # 세부 정보 토글
+                        with st.expander("세부 정보"):
+                            if kind == "movie":
+                                runtime = details.get("runtime")
+                                release = details.get("release_date")
+                                genres = ", ".join([g.get("name") for g in details.get("genres", [])])
+                                st.write(f"개봉: {release or '-'} | 상영시간: {runtime or '-'}분 | 장르: {genres or '-'}")
+                            else:
+                                seasons = details.get("number_of_seasons")
+                                episodes = details.get("number_of_episodes")
+                                first_air = details.get("first_air_date")
+                                last_air = details.get("last_air_date")
+                                genres = ", ".join([g.get("name") for g in details.get("genres", [])])
+                                st.write(f"방영: {first_air or '-'} ~ {last_air or '-'} | 시즌: {seasons or '-'} | 에피소드: {episodes or '-'} | 장르: {genres or '-'}")
+
+# 푸터
+st.markdown("""
+---
+Made with ❤️ by MoodFlix · 데이터 출처: TMDB (The Movie Database)
+""")
