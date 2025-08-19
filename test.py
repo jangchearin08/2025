@@ -1,25 +1,8 @@
-'''
-MoodFlix: 심리 상태 기반 넷플릭스(Netflix) 콘텐츠 추천 앱
-- TMDB API를 이용해 포스터/줄거리/출연진/트레일러를 가져오고,
-  "시청 제공사(Watch Providers)" 정보를 통해 사용 국가에서 Netflix 제공 여부를 확인합니다.
-- 영화와 TV 시리즈를 모두 추천합니다.
-- 어떤 입력 조합(모든 경우의 수)에도 동작하도록, 멀티 선택/강도 가중치/대체 추천/오류 대비 로직을 포함합니다.
-
-필요 패키지 (터미널에서 설치):
-    pip install streamlit requests python-dotenv
-
-실행:
-    streamlit run app.py
-
-TMDB API 키 준비:
-- https://www.themoviedb.org/settings/api 에서 발급
-- .env 파일에 TMDB_API_KEY=YOUR_KEY 로 저장하거나, 앱 사이드바에서 직접 입력
-
-참고:
-- Netflix 제공 정보는 TMDB의 watch/providers 엔드포인트를 사용하며 완벽히 실시간/완전무결하지 않을 수 있습니다.
-- 국가 코드는 ISO-3166-1 (예: KR, US, JP 등)
-'''
-
+# MoodFlix: 심리 상태 기반 넷플릭스(Netflix) 추천 앱
+# - TMDB API를 이용해 포스터/줄거리/출연진/트레일러를 가져옵니다.
+# - "시청 제공사(Watch Providers)" 정보로 지역별 Netflix 제공 여부를 확인합니다.
+# - 영화와 TV 시리즈 모두 지원, 어떤 입력 조합에도 동작.
+# - 오류를 줄이기 위해 긴 설명은 주석(#)으로만 표기합니다.
 
 import os
 import random
