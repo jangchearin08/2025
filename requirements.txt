@@ -381,4 +381,5 @@ st.markdown("""
 ---
 Made with ❤️ by MoodFlix · 데이터 출처: TMDB (The Movie Database)
 """)
+python-dotenv
 
