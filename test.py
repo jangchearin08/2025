@@ -1,4 +1,4 @@
-# app.py
+pip install python-dotenv# app.py
 # 헤이 전용: 심리 프로파일링 + 영화 추천 Streamlit 앱
 # 기능:
 # - 다차원 심리 설문 → 점수화/해석
