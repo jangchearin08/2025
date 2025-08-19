@@ -1,10 +1,15 @@
 import streamlit as st
+import requests
 import random
 
 st.set_page_config(page_title="심리 기반 영화 추천 🎬", page_icon="🎭")
 
 st.title("🎬 내 마음을 위한 영화 추천기")
-st.write("당신의 현재 심리 상태를 선택하면, 어울리는 영화를 추천해드릴게요! 💡")
+st.write("당신의 심리에 딱 맞는 영화를 찾아드릴게요 🍿")
+
+# TMDb API 키 입력 (여기에 본인 키 입력!)
+API_KEY = "YOUR_TMDB_API_KEY"
+BASE_URL = "https://api.themoviedb.org/3"
 
 # 심리 상태 선택
 mood = st.radio(
@@ -22,56 +27,73 @@ genre = st.multiselect(
     ["로맨스 💕", "코미디 😂", "드라마 🎭", "스릴러 🔪", "SF 🚀", "애니메이션 🐭"]
 )
 
-# 심리별 영화 데이터 (장르 포함)
-recommendations = {
-    "행복 😊": [
-        ("인사이드 아웃", "애니메이션 🐭"),
-        ("라라랜드", "로맨스 💕"),
-        ("어바웃 타임", "로맨스 💕"),
-        ("주토피아", "애니메이션 🐭"),
-        ("박물관이 살아있다", "코미디 😂")
-    ],
-    "우울 😔": [
-        ("월터의 상상은 현실이 된다", "드라마 🎭"),
-        ("포레스트 검프", "드라마 🎭"),
-        ("리틀 미스 선샤인", "코미디 😂")
-    ],
-    "스트레스 😵": [
-        ("업", "애니메이션 🐭"),
-        ("주토피아", "애니메이션 🐭"),
-        ("해리포터", "판타지 ✨"),
-        ("박물관이 살아있다", "코미디 😂")
-    ],
-    "지루함 😐": [
-        ("인터스텔라", "SF 🚀"),
-        ("인셉션", "SF 🚀"),
-        ("매트릭스", "SF 🚀"),
-        ("아바타", "SF 🚀")
-    ],
-    "설렘 💖": [
-        ("너의 이름은", "로맨스 💕"),
-        ("비포 선라이즈", "로맨스 💕"),
-        ("어바웃 타임", "로맨스 💕")
-    ],
-    "고독 🥀": [
-        ("허", "드라마 🎭"),
-        ("비긴 어게인", "드라마 🎭"),
-        ("굿 윌 헌팅", "드라마 🎭")
-    ]
+# TMDb 장르 매핑
+genre_map = {
+    "로맨스 💕": 10749,
+    "코미디 😂": 35,
+    "드라마 🎭": 18,
+    "스릴러 🔪": 53,
+    "SF 🚀": 878,
+    "애니메이션 🐭": 16,
 }
 
-# 버튼 클릭 시 영화 추천
-if st.button("영화 추천 받기 🎥"):
-    movie_list = recommendations[mood]
+# 기분별 추천 키워드 (검색용)
+mood_keywords = {
+    "행복 😊": "happy",
+    "우울 😔": "healing",
+    "스트레스 😵": "funny",
+    "지루함 😐": "exciting",
+    "설렘 💖": "romantic",
+    "고독 🥀": "lonely"
+}
 
-    # 장르 선택이 있으면 필터링
-    if genre:
-        filtered = [m for m in movie_list if m[1] in genre]
-        if filtered:
-            movie = random.choice(filtered)
-            st.success(f"✨ 오늘의 추천 영화는 **{movie[0]}** 입니다! ({movie[1]})")
-        else:
-            st.info("해당 기분과 선택한 장르가 맞는 영화가 없어요 😢 다른 장르도 선택해보세요!")
+def get_movies(genre_ids, keyword, count=3):
+    """장르 + 키워드 기반 영화 검색"""
+    genre_param = ",".join(map(str, genre_ids)) if genre_ids else ""
+    url = f"{BASE_URL}/discover/movie"
+    params = {
+        "api_key": API_KEY,
+        "language": "ko-KR",
+        "sort_by": "popularity.desc",
+        "with_genres": genre_param,
+        "page": random.randint(1, 5)  # 랜덤 페이지에서 가져오기
+    }
+    response = requests.get(url, params=params)
+    if response.status_code == 200:
+        movies = response.json().get("results", [])
+        return random.sample(movies, min(count, len(movies)))
+    return []
+
+def get_cast(movie_id):
+    """출연 배우 가져오기"""
+    url = f"{BASE_URL}/movie/{movie_id}/credits"
+    params = {"api_key": API_KEY, "language": "ko-KR"}
+    response = requests.get(url, params=params)
+    if response.status_code == 200:
+        cast = response.json().get("cast", [])
+        return [c["name"] for c in cast[:3]]  # 주요 3명만
+    return []
+
+# 버튼 클릭 시 추천
+if st.button("영화 추천 받기 🎥"):
+    genre_ids = [genre_map[g] for g in genre] if genre else []
+    keyword = mood_keywords[mood]
+
+    movies = get_movies(genre_ids, keyword, count=3)
+
+    if movies:
+        for movie in movies:
+            title = movie["title"]
+            overview = movie.get("overview", "줄거리 없음")
+            poster = f"https://image.tmdb.org/t/p/w500{movie['poster_path']}" if movie.get("poster_path") else None
+            cast = get_cast(movie["id"])
+
+            st.subheader(f"🎬 {title}")
+            if poster:
+                st.image(poster, width=250)
+            st.write(f"**줄거리**: {overview}")
+            if cast:
+                st.write(f"👥 주요 출연진: {', '.join(cast)}")
+            st.markdown("---")
     else:
-        movie = random.choice(movie_list)
-        st.success(f"✨ 오늘의 추천 영화는 **{movie[0]}** 입니다! ({movie[1]})")
+        st.warning("😢 해당 조건에 맞는 영화를 찾을 수 없어요. 다른 기분이나 장르를 선택해보세요!")
