@@ -1,4 +1,4 @@
-"""
+'''
 MoodFlix: 심리 상태 기반 넷플릭스(Netflix) 콘텐츠 추천 앱
 - TMDB API를 이용해 포스터/줄거리/출연진/트레일러를 가져오고,
   "시청 제공사(Watch Providers)" 정보를 통해 사용 국가에서 Netflix 제공 여부를 확인합니다.
@@ -18,7 +18,8 @@ TMDB API 키 준비:
 참고:
 - Netflix 제공 정보는 TMDB의 watch/providers 엔드포인트를 사용하며 완벽히 실시간/완전무결하지 않을 수 있습니다.
 - 국가 코드는 ISO-3166-1 (예: KR, US, JP 등)
-"""
+'''
+
 
 import os
 import random
