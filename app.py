@@ -1,3 +1,9 @@
+# MoodFlix: 심리 상태 기반 넷플릭스(Netflix) 추천 앱
+# - TMDB API를 이용해 포스터/줄거리/출연진/트레일러를 가져옵니다.
+# - "시청 제공사(Watch Providers)" 정보로 지역별 Netflix 제공 여부를 확인합니다.
+# - 영화와 TV 시리즈 모두 지원, 어떤 입력 조합에도 동작.
+# - 오류를 줄이기 위해 긴 설명은 주석(#)으로만 표기합니다.
+
 import os
 import random
 import time
@@ -7,29 +13,25 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 
+# 환경변수 로드 (.env 없으면 무시)
+load_dotenv()
+
 # -------------------------------------
 # 기본 설정
 # -------------------------------------
 st.set_page_config(
     page_title="MoodFlix | 심리 상태 기반 넷플릭스 추천",
-    page_icon="🎬",
+    page_icon="EMOJI_2",
     layout="wide",
 )
 
-# 환경변수 로드 (.env 없으면 무시)
-try:
-    load_dotenv()
-    # app.py
-import os
-import requests
-import streamlit as st
-from dotenv import load_dotenv
-
-load_dotenv()
-
 TMDB_BASE = "https://api.themoviedb.org/3"
+TMDB_IMG = "https://image.tmdb.org/t/p/"
 
-# === 여기부터 붙여넣기 (함수들) ===
+# Netflix provider id (TMDB 기준)
+NETFLIX_PROVIDER_ID = 8
+
+# === 함수들 시작 ===
 def get_api_key():
     k = st.session_state.get("TMDB_API_KEY")
     if not k:
@@ -50,43 +52,48 @@ def tmdb_get(path, params=None, api_key=None, lang="ko-KR"):
     r.raise_for_status()
     return r.json()
 
-def sidebar_ui():
-    st.sidebar.subheader("설정")
-    api_key_input = st.sidebar.text_input(
-        "TMDb API Key",
-        value=st.session_state.get("TMDB_API_KEY", ""),
-        type="password",
-        help="여기 입력하거나 secrets/.env로도 설정 가능"
+# -------------------------------------
+# 유틸: TMDB 요청
+# -------------------------------------
+
+def tmdb_request(endpoint: str, params: Optional[dict] = None) -> dict:
+    """TMDB API 호출 헬퍼 (오류 내성 포함)."""
+    url = f"{TMDB_BASE}/{endpoint.lstrip('/')}"
+    headers = {"accept": "application/json"}
+    params = params.copy() if params else {}
+    params["api_key"] = st.session_state.get("TMDB_API_KEY", os.getenv("TMDB_API_KEY", ""))
+
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        st.warning(f"TMDB 요청 오류: {endpoint} → {e}")
+        return {}
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_genre_maps() -> Tuple[Dict[int, str], Dict[int, str]]:
+    movie = tmdb_request("genre/movie/list", {"language": "ko-KR"}).get("genres", [])
+    tv = tmdb_request("genre/tv/list", {"language": "ko-KR"}).get("genres", [])
+    return (
+        {g["id"]: g["name"] for g in movie},
+        {g["id"]: g["name"] for g in tv},
     )
-    if api_key_input:
-        st.session_state["TMDB_API_KEY"] = api_key_input.strip()
 
-    if st.sidebar.button("키 확인"):
-        key = get_api_key()
-        if not key:
-            st.sidebar.warning("키가 비어 있어.")
-        else:
-            try:
-                ping = requests.get(f"{TMDB_BASE}/configuration", params={"api_key": key}, timeout=10)
-                st.sidebar.success("키 정상!" if ping.status_code == 200 else f"실패: {ping.status_code}")
-            except Exception as e:
-                st.sidebar.error(f"오류: {e}")
-# === 여기까지 함수들 ===
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_configuration() -> dict:
+    return tmdb_request("configuration")
 
-def main():
-    st.set_page_config(page_title="넷플릭스 추천", page_icon="🎬", layout="wide")
-    st.title("넷플릭스 기반 심리-무드 추천 🎬")
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_provider_regions() -> List[str]:
+    data = tmdb_request("watch/providers/regions").get("results", [])
+    # ISO 3166-1 code 목록
+    return sorted({x.get("iso_3166_1", "") for x in data if x.get("iso_3166_1")})
 
-    # 사이드바 먼저
-    sidebar_ui()
+# -------------------------------------
+# 심리 → 추천 파이프라인 설정
+# -------------------------------------
 
-    # 여기서 키 확보
-    TMDB_API_KEY = get_api_key()
-    if not TMDB_API_KEY:
-        st.warning("TMDB API Key가 필요해. 사이드바에 입력하거나 secrets/.env로 설정해줘.")
-        st.stop()
-
-    # === 여기 아래에 네가 만든 추천 로직 그대로 ===
-    # 예: discover 호출, 무드 계산, 결과 렌더링 등
-    # data = tmdb_get("/discover/movie", {"with_watch_providers": 8, "watch_region": "KR"}, api_key=TMDB_API_KEY)
-    # st.write(data)
+MOODS = [
+    "불안", "우울", "스트레스", "외로움", "분노", "무기력",
+    "행복", "호
