@@ -13,45 +13,35 @@ st.set_page_config(page_title="TMDB Regions Demo", page_icon="🎬", layout="cen
 TMDB_BASE = "https://api.themoviedb.org/3"
 DEFAULT_LANG = "ko-KR"
 
-# ========================= ADI(API) 적는 곳 (방법 A: 코드에 직접) =========================
-# 아래 두 값에 직접 넣으면, secrets/환경변수보다 "마지막 순위"로 사용돼.
-# 안전을 생각하면 배포 때는 비워두고 B 또는 C를 권장.
-HARDCODED_TMDB_V3_KEY = ""         # 예: "abcdef1234567890abcdef1234567890"
-HARDCODED_TMDB_V4_TOKEN = ""       # 예: "eyJhbGciOiJIUzI1NiJ9...." (Bearer 토큰)
-# =======================================================================================
+# ========================= ADI(API) 키(하드코드 기본값) =========================
+# 여기 값으로 앱 시작 시 자동 입력돼. 배포/공유 시엔 secrets 또는 환경변수 사용 추천.
+HARDCODED_TMDB_V3_KEY = "98eaf6d20dad569fcbf4dd59ab8cc47e"
+HARDCODED_TMDB_V4_TOKEN = ""  # 있으면 여기에 넣어두면 시작 시 자동 입력됨
+# ============================================================================
 
 
 # === 초기 세션 기본값 주입(앱 실행 시 자동 채움) ===
 def init_session_defaults():
     # v3 API Key
     if "TMDB_API_KEY" not in st.session_state:
-        v3 = None
-        # (방법 B) secrets.toml
-        if hasattr(st, "secrets"):
-            v3 = st.secrets.get("TMDB_API_KEY", None)
-        # (방법 C) 환경변수
+        # 우선순위: 하드코드 -> secrets -> 환경변수
+        v3 = HARDCODED_TMDB_V3_KEY or ""
+        if not v3 and hasattr(st, "secrets"):
+            v3 = st.secrets.get("TMDB_API_KEY", "") or ""
         if not v3:
-            v3 = os.getenv("TMDB_API_KEY")
-        # (방법 A) 코드 하드코드
-        if not v3:
-            v3 = HARDCODED_TMDB_V3_KEY
-        st.session_state["TMDB_API_KEY"] = (v3 or "").strip()
+            v3 = os.getenv("TMDB_API_KEY", "") or ""
+        st.session_state["TMDB_API_KEY"] = v3.strip()
 
     # v4 Access Token
     if "TMDB_ACCESS_TOKEN" not in st.session_state:
-        v4 = None
-        # (방법 B) secrets.toml
-        if hasattr(st, "secrets"):
-            v4 = st.secrets.get("TMDB_ACCESS_TOKEN", None)
-        # (방법 C) 환경변수
+        # 우선순위: 하드코드 -> secrets -> 환경변수
+        v4 = HARDCODED_TMDB_V4_TOKEN or ""
+        if not v4 and hasattr(st, "secrets"):
+            v4 = st.secrets.get("TMDB_ACCESS_TOKEN", "") or ""
         if not v4:
-            v4 = os.getenv("TMDB_ACCESS_TOKEN")
-        # (방법 A) 코드 하드코드
-        if not v4:
-            v4 = HARDCODED_TMDB_V4_TOKEN
-        st.session_state["TMDB_ACCESS_TOKEN"] = (v4 or "").strip()
+            v4 = os.getenv("TMDB_ACCESS_TOKEN", "") or ""
+        st.session_state["TMDB_ACCESS_TOKEN"] = v4.strip()
 
-    # 언어 기본
     if "APP_LANG" not in st.session_state:
         st.session_state["APP_LANG"] = DEFAULT_LANG
 
@@ -85,8 +75,7 @@ def _attach_auth_params(params: Dict[str, Any]) -> Dict[str, Any]:
     v4 = get_access_token()
     v3 = get_api_key()
     if v4:
-        # v4 쓰면 api_key는 절대 추가하지 않음
-        return params
+        return params  # v4 사용 시 api_key 추가 금지
     if v3:
         p = params.copy()
         p["api_key"] = v3
@@ -104,7 +93,7 @@ def tmdb_request(
     """
     TMDB API 호출(안전판).
     - v4 토큰 있으면 헤더 인증, 없으면 v3 쿼리 인증
-    - 항상 text로 받은 후 JSON 여부를 확인하고 파싱
+    - 항상 text로 받은 후 JSON 여부 확인 후 파싱
     - JSON 아님/빈 응답이면 {} 반환
     - 429/5xx 재시도
     """
@@ -185,19 +174,18 @@ def tmdb_healthcheck_cached(_fp: str) -> dict:
 with st.sidebar:
     st.header("TMDB 설정")
 
-    # 여기서도 바로 편집 가능
     api_key_input = st.text_input(
         "TMDB API Key (v3)",
         value=st.session_state.get("TMDB_API_KEY", ""),
-        type="password",
-        help="v3 키. 배포 시에는 코드 하드코드 대신 secrets/환경변수 사용 권장.",
+        type="password",  # 화면에서 키는 가려짐
+        help="v3 키. 배포 시엔 하드코드 대신 secrets/환경변수 사용 권장.",
     )
 
     access_token_input = st.text_input(
         "TMDB Access Token (v4 Bearer)",
         value=st.session_state.get("TMDB_ACCESS_TOKEN", ""),
         type="password",
-        help="v4 토큰. 존재하면 v4 우선, v3와 동시에 쓰지 않아.",
+        help="v4 토큰이 있으면 v4 우선, v3와 동시에 쓰지 않아.",
     )
 
     lang_input = st.selectbox(
@@ -224,7 +212,7 @@ with st.sidebar:
 
 # === 메인 영역 ===
 st.title("🎬 TMDB Regions Demo")
-st.write("앱 켜면 키/토큰이 자동 입력돼. 사이드바에서 바꾸고 저장하면 즉시 반영!")
+st.write("앱 켜면 네 ADI(API) 키가 자동으로 입력돼. 필요하면 사이드바에서 수정하고 저장하면 즉시 반영!")
 
 with st.expander("연결 상태 점검(Health Check)", expanded=True):
     hc = tmdb_healthcheck_cached(auth_fingerprint())
@@ -248,3 +236,4 @@ with col2:
             st.write(regions)
         else:
             st.warning("가져온 지역 코드가 없어. 인증/네트워크 또는 레이트 리밋을 확인해줘.")
+        
